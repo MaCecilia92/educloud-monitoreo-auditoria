@@ -1,0 +1,1269 @@
+AWSTemplateFormatVersion: '2010-09-09'   # Única versión válida del formato de plantilla (no es una fecha a actualizar)
+Description: 'EduCloud - Monitoreo: temas SNS, 19 alarmas de CloudWatch, filtro de metricas de logs, presupuesto y dashboard de operaciones'
+# Autora: Maria Cecilia Alegre - Pre-entrega 7
+#
+# Se despliega en us-east-1: las metricas de facturacion (AWS/Billing) y de CloudFront
+# solo existen en esa region. Requisito previo: activar "Recibir alertas de facturacion"
+# en Billing > Preferencias de facturacion (si no, EstimatedCharges no se publica).
+#
+# Criterios para evitar alarmas "ruidosas":
+#   - ningun periodo menor a 5 minutos, y casi todas piden 2 o 3 periodos seguidos;
+#   - TreatMissingData = notBreaching en las metricas de errores (sin trafico no hay errores);
+#   - dos niveles: CRITICA (accion inmediata, avisa tambien cuando se resuelve) y AVISO.
+
+Parameters:
+  EmailAlertas:
+    Type: String
+    Default: admin@example.com
+    Description: Correo del administrador (hay que confirmar la suscripcion desde el mail que envia SNS)
+  NombreAsg:
+    Type: String
+    Default: educloud-web-asg
+  NombreAlb:
+    Type: String
+    Description: 'Nombre completo del ALB para CloudWatch, por ejemplo app/educloud-alb/0123456789abcdef'
+  TargetGroupFullName:
+    Type: String
+    Description: 'Por ejemplo targetgroup/educloud-web/0123456789abcdef'
+  IdRds:
+    Type: String
+    Default: educloud-mysql
+  NatGatewayA:
+    Type: String
+    Description: ID del NAT Gateway de la zona A (nat-...)
+  NatGatewayB:
+    Type: String
+    Description: ID del NAT Gateway de la zona B (nat-...)
+  DistribucionCloudFront:
+    Type: String
+    Description: ID de la distribucion de CloudFront (E...)
+  BucketContenido:
+    Type: String
+    Default: educloud-contenido-usuarios-2026-use1
+  FuncionBienvenida:
+    Type: String
+    Default: enviar-bienvenida
+  PresupuestoMensual:
+    Type: Number
+    Default: 30
+    Description: Presupuesto mensual en USD para AWS Budgets
+
+Rules:
+  SoloUsEast1:
+    Assertions:
+      - Assert: !Equals [!Ref AWS::Region, us-east-1]
+        AssertDescription: Las metricas de facturacion y de CloudFront solo existen en us-east-1
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # TEMAS DE SNS: dos niveles de urgencia
+  # ---------------------------------------------------------------------------
+  TemaAlertasCriticas:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: educloud-alertas-criticas
+      DisplayName: EduCloud CRITICA
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref EmailAlertas
+
+  TemaAlertasAvisos:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: educloud-alertas-avisos
+      DisplayName: EduCloud aviso
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref EmailAlertas
+
+  # Permite publicar a los servicios que avisan: CloudWatch (alarmas), Budgets y EventBridge
+  # (este ultimo lo usa la plantilla de auditoria para los cambios criticos de CloudTrail).
+  PoliticaTemas:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref TemaAlertasCriticas, !Ref TemaAlertasAvisos]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ServiciosQuePublican
+            Effect: Allow
+            Principal:
+              Service: [cloudwatch.amazonaws.com, budgets.amazonaws.com, events.amazonaws.com]
+            Action: sns:Publish
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------------------
+  # ERRORES DE LA API DESDE LOS LOGS
+  # El agente de CloudWatch de las EC2 envia el access_log de Apache a este grupo.
+  # ---------------------------------------------------------------------------
+  GrupoLogsApp:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /educloud/app
+      RetentionInDays: 30
+
+  FiltroErrores5xx:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref GrupoLogsApp
+      # Formato de Apache: IP - usuario [fecha] "GET /ruta HTTP/1.1" CODIGO BYTES
+      FilterPattern: '[ip, identidad, usuario, fecha, pedido, codigo=5*, bytes, ...]'   # '...' = acepta campos extra (referer, navegador)
+      MetricTransformations:
+        - MetricNamespace: EduCloud/App
+          MetricName: ErroresHTTP5xx
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # ---------------------------------------------------------------------------
+  # ALARMAS (la misma lista que la matriz del README)
+  # ---------------------------------------------------------------------------
+  AlarmaEc2Cpu:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-ec2-cpu-alta
+      AlarmDescription: '[Advertencia] CPU promedio > 80 % durante 3 períodos seguidos de 5 min (15 min). El Auto Scaling ya agrega instancias al 60 %. Si igual llega al 80 % sostenido, el escalado no alcanza o llegó a su máximo (6).'
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref NombreAsg
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref TemaAlertasAvisos]
+
+  AlarmaEc2Chequeos:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-ec2-chequeo-estado
+      AlarmDescription: '[Crítica] StatusCheckFailed ≥ 1 durante 2 períodos de 5 min (10 min). Una instancia falla el chequeo de hardware o de sistema operativo. El ASG la reemplaza, pero si se repite hay un problema de fondo (AMI, disco, memoria).'
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref NombreAsg
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref TemaAlertasCriticas]
+      OKActions: [!Ref TemaAlertasCriticas]           # avisa también cuando se resuelve
+
+  AlarmaAlbSinSanos:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-alb-sin-destinos-sanos
+      AlarmDescription: '[Crítica] HealthyHostCount < 1 durante 2 períodos de 5 min (10 min). No queda ninguna instancia sana: el sitio está caído para todos los estudiantes.'
+      Namespace: AWS/ApplicationELB
+      MetricName: HealthyHostCount
+      Dimensions:
+        - Name: TargetGroup
+          Value: !Ref TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !Ref NombreAlb
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref TemaAlertasCriticas]
+      OKActions: [!Ref TemaAlertasCriticas]           # avisa también cuando se resuelve
+
+  AlarmaAlbNoSanos:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-alb-destinos-no-sanos
+      AlarmDescription: '[Advertencia] UnHealthyHostCount ≥ 1 durante 3 períodos de 5 min (15 min). Una instancia falla el health check del ALB por más tiempo del que tarda en reemplazarse: aviso preventivo antes de perder capacidad.'
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: TargetGroup
+          Value: !Ref TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !Ref NombreAlb
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TemaAlertasAvisos]
+
+  AlarmaAlb5xx:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-alb-errores-5xx
+      AlarmDescription: '[Crítica] Errores 5xx de la app > 25 durante 2 períodos de 5 min (10 min). La aplicación está devolviendo errores a los usuarios (por ejemplo, perdió la conexión con RDS).'
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref NombreAlb
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 25
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TemaAlertasCriticas]
+      OKActions: [!Ref TemaAlertasCriticas]           # avisa también cuando se resuelve
+
+  AlarmaAlbLatencia:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-alb-latencia-p95
+      AlarmDescription: '[Advertencia] Tiempo de respuesta p95 > 1,5 s durante 3 períodos de 5 min (15 min). El 5 % de los pedidos más lentos tarda más de 1,5 s: la experiencia se degrada antes de que aparezcan errores. Se usa el percentil 95, no el promedio, porque el promedio esconde a los usuarios más afectados.'
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref NombreAlb
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 1.5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TemaAlertasAvisos]
+
+  AlarmaRdsEspacio:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-rds-espacio-libre-bajo
+      AlarmDescription: '[Crítica] Espacio libre < 3 GiB (15 % de 20 GB) durante 2 períodos de 5 min (10 min). Si la base se queda sin disco, deja de aceptar escrituras: no hay inscripciones ni pagos. 3 GiB da margen para ampliar el almacenamiento con tiempo.'
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref IdRds
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 3221225472
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref TemaAlertasCriticas]
+      OKActions: [!Ref TemaAlertasCriticas]           # avisa también cuando se resuelve
+
+  AlarmaRdsCpu:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-rds-cpu-alta
+      AlarmDescription: '[Advertencia] CPU promedio > 80 % durante 3 períodos de 5 min (15 min). Consultas lentas o que faltan índices. Si es sostenido, hay que optimizar o agrandar la clase de instancia.'
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref IdRds
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref TemaAlertasAvisos]
+
+  AlarmaRdsConexiones:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-rds-conexiones-altas
+      AlarmDescription: '[Advertencia] Conexiones > 60 durante 2 períodos de 5 min (10 min). Una db.t4g.micro admite alrededor de 80 conexiones. Por encima de 60 conviene revisar que la app no esté dejando conexiones abiertas.'
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref IdRds
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 60
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref TemaAlertasAvisos]
+
+  AlarmaRdsMemoria:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-rds-memoria-baja
+      AlarmDescription: '[Advertencia] Memoria libre < 100 MiB durante 3 períodos de 5 min (15 min). Con poca memoria, MySQL lee más del disco y todo se vuelve lento.'
+      Namespace: AWS/RDS
+      MetricName: FreeableMemory
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref IdRds
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 104857600
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref TemaAlertasAvisos]
+
+  AlarmaNatPuertosA:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-nat-a-error-puertos
+      AlarmDescription: '[Advertencia] ErrorPortAllocation > 0 (NAT A) durante 1 período de 5 min. El NAT se quedó sin puertos para nuevas conexiones salientes: las EC2 de esa zona no pueden llamar a SNS, Secrets Manager ni a internet. Nunca debería pasar, por eso el umbral es 0.'
+      Namespace: AWS/NATGateway
+      MetricName: ErrorPortAllocation
+      Dimensions:
+        - Name: NatGatewayId
+          Value: !Ref NatGatewayA
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TemaAlertasAvisos]
+
+  AlarmaNatPuertosB:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-nat-b-error-puertos
+      AlarmDescription: '[Advertencia] ErrorPortAllocation > 0 (NAT B) durante 1 período de 5 min. Lo mismo, para la zona B.'
+      Namespace: AWS/NATGateway
+      MetricName: ErrorPortAllocation
+      Dimensions:
+        - Name: NatGatewayId
+          Value: !Ref NatGatewayB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TemaAlertasAvisos]
+
+  AlarmaNatTrafico:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-nat-trafico-salida-alto
+      AlarmDescription: '[Costos] Más de 5 GiB salientes por hora (NAT A) durante 1 período de 1 hora. El NAT cobra por GB procesado. Tanto tráfico de salida desde subredes privadas no es normal en EduCloud: puede ser una descarga en bucle o una instancia comprometida.'
+      Namespace: AWS/NATGateway
+      MetricName: BytesOutToDestination
+      Dimensions:
+        - Name: NatGatewayId
+          Value: !Ref NatGatewayA
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 5368709120
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TemaAlertasAvisos]
+
+  AlarmaCloudFront5xx:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-cloudfront-tasa-5xx
+      AlarmDescription: '[Crítica] Tasa de errores 5xx > 5 % durante 2 períodos de 5 min (10 min). Lo que ven los usuarios de todo el mundo: incluye los errores del origen (ALB o S3) y los del propio CloudFront.'
+      Namespace: AWS/CloudFront
+      MetricName: 5xxErrorRate
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref DistribucionCloudFront
+        - Name: Region
+          Value: 'Global'
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TemaAlertasCriticas]
+      OKActions: [!Ref TemaAlertasCriticas]           # avisa también cuando se resuelve
+
+  AlarmaLambdaErrores:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-lambda-bienvenida-errores
+      AlarmDescription: '[Advertencia] Errores ≥ 3 durante 1 período de 5 min. Los nuevos estudiantes no están recibiendo el correo de bienvenida (por ejemplo, SES rechaza los envíos). Un error suelto se reintenta solo, por eso el umbral es 3.'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FuncionBienvenida
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TemaAlertasAvisos]
+
+  AlarmaS3Tamano:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-s3-contenido-mayor-50gb
+      AlarmDescription: '[Costos] Tamaño en S3 Standard > 50 GiB durante 1 día (S3 publica esta métrica una vez por día). Controla el crecimiento del almacenamiento: si se pasa, conviene revisar que el ciclo de vida de la Pre-entrega 4 esté moviendo los videos viejos a clases más baratas.'
+      Namespace: AWS/S3
+      MetricName: BucketSizeBytes
+      Dimensions:
+        - Name: BucketName
+          Value: !Ref BucketContenido
+        - Name: StorageType
+          Value: 'StandardStorage'
+      Statistic: Average
+      Period: 86400
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 53687091200
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref TemaAlertasAvisos]
+
+  AlarmaErroresApi:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-app-errores-api-logs
+      AlarmDescription: '[Advertencia] Líneas con código 5xx en el log > 10 durante 2 períodos de 5 min (10 min). Viene de un filtro de métricas sobre el log de Apache: detecta errores de la API desde adentro del servidor, incluso los que no pasan por el ALB.'
+      Namespace: EduCloud/App
+      MetricName: ErroresHTTP5xx
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref TemaAlertasAvisos]
+
+  AlarmaFacturacion10:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-facturacion-mayor-10usd
+      AlarmDescription: '[Costos] Gasto estimado del mes > USD 10 durante 1 período de 6 horas. Primer aviso de presupuesto. Esta métrica se publica varias veces por día y solo existe en us-east-1, con las alertas de facturación activadas.'
+      Namespace: AWS/Billing
+      MetricName: EstimatedCharges
+      Dimensions:
+        - Name: Currency
+          Value: 'USD'
+      Statistic: Maximum
+      Period: 21600
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref TemaAlertasAvisos]
+
+  AlarmaFacturacion25:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: educloud-facturacion-mayor-25usd
+      AlarmDescription: '[Crítica] Gasto estimado del mes > USD 25 durante 1 período de 6 horas. Se acerca al presupuesto de USD 30: hay que revisar en Cost Explorer qué servicio lo explica.'
+      Namespace: AWS/Billing
+      MetricName: EstimatedCharges
+      Dimensions:
+        - Name: Currency
+          Value: 'USD'
+      Statistic: Maximum
+      Period: 21600
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 25
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref TemaAlertasCriticas]
+      OKActions: [!Ref TemaAlertasCriticas]           # avisa también cuando se resuelve
+
+  # ---------------------------------------------------------------------------
+  # PRESUPUESTO: complementa a EstimatedCharges con el gasto PROYECTADO del mes
+  # ---------------------------------------------------------------------------
+  Presupuesto:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: educloud-mensual
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref PresupuestoMensual
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:              # el pronostico del mes supera el presupuesto
+            NotificationType: FORECASTED
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref TemaAlertasAvisos
+        - Notification:              # ya se gasto el 80 %
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref TemaAlertasCriticas
+
+  # ---------------------------------------------------------------------------
+  # DASHBOARD (mismo JSON que dashboard/educloud-operaciones.json)
+  # ---------------------------------------------------------------------------
+  DashboardOperaciones:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: EduCloud-Operaciones
+      DashboardBody: !Sub |
+        {
+          "start": "-PT24H",
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0,
+              "y": 0,
+              "width": 10,
+              "height": 4,
+              "properties": {
+                "markdown": "## EduCloud · Operaciones\n**Primero mirá el estado de las alarmas (derecha).** Si todo está en verde, recorré las filas de arriba hacia abajo: **Cómputo → Red → Datos → Costos y errores**.\n\nRegión us-east-1 · Últimas 24 h · Plan completo: [README](https://github.com/MaCecilia92/educloud-monitoreo-auditoria)"
+              }
+            },
+            {
+              "type": "alarm",
+              "x": 10,
+              "y": 0,
+              "width": 14,
+              "height": 4,
+              "properties": {
+                "title": "① Estado de las alarmas críticas",
+                "alarms": [
+                  "${AlarmaEc2Chequeos.Arn}",
+                  "${AlarmaAlbSinSanos.Arn}",
+                  "${AlarmaAlb5xx.Arn}",
+                  "${AlarmaRdsEspacio.Arn}",
+                  "${AlarmaCloudFront5xx.Arn}",
+                  "${AlarmaFacturacion25.Arn}"
+                ],
+                "sortBy": "stateUpdatedTimestamp"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 4,
+              "width": 4,
+              "height": 4,
+              "properties": {
+                "title": "Instancias sanas (ALB)",
+                "view": "singleValue",
+                "region": "us-east-1",
+                "stat": "Minimum",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/ApplicationELB",
+                    "HealthyHostCount",
+                    "TargetGroup",
+                    "${TargetGroupFullName}",
+                    "LoadBalancer",
+                    "${NombreAlb}",
+                    {
+                      "label": "Sanas"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 4,
+              "y": 4,
+              "width": 4,
+              "height": 4,
+              "properties": {
+                "title": "Errores 5xx (5 min)",
+                "view": "singleValue",
+                "region": "us-east-1",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/ApplicationELB",
+                    "HTTPCode_Target_5XX_Count",
+                    "LoadBalancer",
+                    "${NombreAlb}",
+                    {
+                      "label": "5xx de la app"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 4,
+              "width": 4,
+              "height": 4,
+              "properties": {
+                "title": "Tiempo de respuesta p95",
+                "view": "singleValue",
+                "region": "us-east-1",
+                "stat": "p95",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/ApplicationELB",
+                    "TargetResponseTime",
+                    "LoadBalancer",
+                    "${NombreAlb}",
+                    {
+                      "label": "Segundos"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 4,
+              "width": 4,
+              "height": 4,
+              "properties": {
+                "title": "Espacio libre en RDS",
+                "view": "singleValue",
+                "region": "us-east-1",
+                "stat": "Minimum",
+                "period": 300,
+                "metrics": [
+                  [
+                    {
+                      "expression": "m1/1073741824",
+                      "label": "GiB libres",
+                      "id": "e1"
+                    }
+                  ],
+                  [
+                    "AWS/RDS",
+                    "FreeStorageSpace",
+                    "DBInstanceIdentifier",
+                    "${IdRds}",
+                    {
+                      "id": "m1",
+                      "visible": false
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 4,
+              "width": 4,
+              "height": 4,
+              "properties": {
+                "title": "Almacenamiento en S3 (contenido)",
+                "view": "singleValue",
+                "region": "us-east-1",
+                "stat": "Average",
+                "period": 86400,
+                "metrics": [
+                  [
+                    {
+                      "expression": "m1/1073741824",
+                      "label": "GiB en S3 Standard",
+                      "id": "e1"
+                    }
+                  ],
+                  [
+                    "AWS/S3",
+                    "BucketSizeBytes",
+                    "BucketName",
+                    "${BucketContenido}",
+                    "StorageType",
+                    "StandardStorage",
+                    {
+                      "id": "m1",
+                      "visible": false
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 20,
+              "y": 4,
+              "width": 4,
+              "height": 4,
+              "properties": {
+                "title": "Gasto estimado del mes (USD)",
+                "view": "singleValue",
+                "region": "us-east-1",
+                "stat": "Maximum",
+                "period": 21600,
+                "metrics": [
+                  [
+                    "AWS/Billing",
+                    "EstimatedCharges",
+                    "Currency",
+                    "USD",
+                    {
+                      "label": "USD acumulados"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 8,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Cómputo · CPU del Auto Scaling Group (%)",
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "stat": "Average",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/EC2",
+                    "CPUUtilization",
+                    "AutoScalingGroupName",
+                    "${NombreAsg}",
+                    {
+                      "label": "CPU promedio"
+                    }
+                  ],
+                  [
+                    "...",
+                    {
+                      "stat": "Maximum",
+                      "label": "CPU máxima"
+                    }
+                  ]
+                ],
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "max": 100,
+                    "showUnits": false,
+                    "label": "%"
+                  }
+                },
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "label": "Escala el ASG (60 %)",
+                      "value": 60,
+                      "color": "#ff7f0e"
+                    },
+                    {
+                      "label": "Alarma (80 %)",
+                      "value": 80,
+                      "color": "#d62728"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 8,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Cómputo · Pedidos y errores en el ALB",
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/ApplicationELB",
+                    "RequestCount",
+                    "LoadBalancer",
+                    "${NombreAlb}",
+                    {
+                      "label": "Pedidos"
+                    }
+                  ],
+                  [
+                    ".",
+                    "HTTPCode_Target_5XX_Count",
+                    ".",
+                    ".",
+                    {
+                      "label": "5xx de la app",
+                      "yAxis": "right",
+                      "color": "#d62728"
+                    }
+                  ],
+                  [
+                    ".",
+                    "HTTPCode_ELB_5XX_Count",
+                    ".",
+                    ".",
+                    {
+                      "label": "5xx del ALB",
+                      "yAxis": "right",
+                      "color": "#9467bd"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 8,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Cómputo · Salud de las instancias",
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "stat": "Average",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/ApplicationELB",
+                    "HealthyHostCount",
+                    "TargetGroup",
+                    "${TargetGroupFullName}",
+                    "LoadBalancer",
+                    "${NombreAlb}",
+                    {
+                      "label": "Sanas",
+                      "color": "#2ca02c"
+                    }
+                  ],
+                  [
+                    ".",
+                    "UnHealthyHostCount",
+                    ".",
+                    ".",
+                    ".",
+                    ".",
+                    {
+                      "label": "No sanas",
+                      "color": "#d62728"
+                    }
+                  ],
+                  [
+                    "AWS/EC2",
+                    "StatusCheckFailed",
+                    "AutoScalingGroupName",
+                    "${NombreAsg}",
+                    {
+                      "stat": "Maximum",
+                      "label": "Chequeo fallido (0/1)"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 14,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Red · Tráfico saliente por los NAT Gateway",
+                "view": "timeSeries",
+                "stacked": true,
+                "region": "us-east-1",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/NATGateway",
+                    "BytesOutToDestination",
+                    "NatGatewayId",
+                    "${NatGatewayA}",
+                    {
+                      "label": "NAT A → internet"
+                    }
+                  ],
+                  [
+                    "...",
+                    "${NatGatewayB}",
+                    {
+                      "label": "NAT B → internet"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 14,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Red · Problemas en los NAT Gateway",
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/NATGateway",
+                    "ErrorPortAllocation",
+                    "NatGatewayId",
+                    "${NatGatewayA}",
+                    {
+                      "label": "Error de puertos A"
+                    }
+                  ],
+                  [
+                    "...",
+                    "${NatGatewayB}",
+                    {
+                      "label": "Error de puertos B"
+                    }
+                  ],
+                  [
+                    ".",
+                    "PacketsDropCount",
+                    ".",
+                    "${NatGatewayA}",
+                    {
+                      "label": "Paquetes descartados A"
+                    }
+                  ],
+                  [
+                    "...",
+                    "${NatGatewayB}",
+                    {
+                      "label": "Paquetes descartados B"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 14,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Red · CloudFront (usuarios de todo el mundo)",
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/CloudFront",
+                    "Requests",
+                    "DistributionId",
+                    "${DistribucionCloudFront}",
+                    "Region",
+                    "Global",
+                    {
+                      "stat": "Sum",
+                      "label": "Pedidos"
+                    }
+                  ],
+                  [
+                    ".",
+                    "5xxErrorRate",
+                    ".",
+                    ".",
+                    ".",
+                    ".",
+                    {
+                      "stat": "Average",
+                      "label": "Tasa 5xx (%)",
+                      "yAxis": "right",
+                      "color": "#d62728"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 20,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Datos · Espacio libre en RDS (GiB)",
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "stat": "Minimum",
+                "period": 300,
+                "metrics": [
+                  [
+                    {
+                      "expression": "m1/1073741824",
+                      "label": "GiB libres",
+                      "id": "e1"
+                    }
+                  ],
+                  [
+                    "AWS/RDS",
+                    "FreeStorageSpace",
+                    "DBInstanceIdentifier",
+                    "${IdRds}",
+                    {
+                      "id": "m1",
+                      "visible": false
+                    }
+                  ]
+                ],
+                "yAxis": {
+                  "left": {
+                    "min": 0,
+                    "showUnits": false,
+                    "label": "GiB"
+                  }
+                },
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "label": "Alarma (3 GiB = 15 %)",
+                      "value": 3,
+                      "color": "#d62728",
+                      "fill": "below"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 20,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Datos · Carga de RDS",
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "stat": "Average",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/RDS",
+                    "CPUUtilization",
+                    "DBInstanceIdentifier",
+                    "${IdRds}",
+                    {
+                      "label": "CPU (%)"
+                    }
+                  ],
+                  [
+                    ".",
+                    "DatabaseConnections",
+                    ".",
+                    ".",
+                    {
+                      "label": "Conexiones",
+                      "yAxis": "right"
+                    }
+                  ],
+                  [
+                    ".",
+                    "ReadLatency",
+                    ".",
+                    ".",
+                    {
+                      "label": "Latencia de lectura (s)",
+                      "yAxis": "right",
+                      "visible": false
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 20,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Datos · Crecimiento del bucket de contenido (30 días)",
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "stat": "Average",
+                "period": 86400,
+                "start": "-P30D",
+                "metrics": [
+                  [
+                    {
+                      "expression": "m1/1073741824",
+                      "label": "GiB (S3 Standard)",
+                      "id": "e1"
+                    }
+                  ],
+                  [
+                    "AWS/S3",
+                    "BucketSizeBytes",
+                    "BucketName",
+                    "${BucketContenido}",
+                    "StorageType",
+                    "StandardStorage",
+                    {
+                      "id": "m1",
+                      "visible": false
+                    }
+                  ],
+                  [
+                    ".",
+                    "NumberOfObjects",
+                    ".",
+                    ".",
+                    "StorageType",
+                    "AllStorageTypes",
+                    {
+                      "label": "Cantidad de objetos",
+                      "yAxis": "right"
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 26,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "title": "Costos · Gasto estimado acumulado del mes (USD)",
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "stat": "Maximum",
+                "period": 21600,
+                "start": "-P30D",
+                "metrics": [
+                  [
+                    "AWS/Billing",
+                    "EstimatedCharges",
+                    "Currency",
+                    "USD",
+                    {
+                      "label": "USD"
+                    }
+                  ]
+                ],
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "label": "Aviso USD 10",
+                      "value": 10,
+                      "color": "#ff7f0e"
+                    },
+                    {
+                      "label": "Crítica USD 25",
+                      "value": 25,
+                      "color": "#d62728"
+                    },
+                    {
+                      "label": "Presupuesto USD 30",
+                      "value": 30,
+                      "color": "#7f7f7f"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "type": "log",
+              "x": 8,
+              "y": 26,
+              "width": 10,
+              "height": 6,
+              "properties": {
+                "title": "Errores · Endpoints de la API con más errores 5xx (Logs Insights)",
+                "region": "us-east-1",
+                "view": "table",
+                "query": "SOURCE '/educloud/app' | parse @message '\"* * *\" * *' as metodo, ruta, protocolo, codigo, bytes | filter codigo like /^5/ | stats count(*) as errores by ruta, codigo | sort errores desc | limit 10"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 18,
+              "y": 26,
+              "width": 6,
+              "height": 6,
+              "properties": {
+                "title": "Errores · Lambda enviar-bienvenida",
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "stat": "Sum",
+                "period": 300,
+                "metrics": [
+                  [
+                    "AWS/Lambda",
+                    "Errors",
+                    "FunctionName",
+                    "${FuncionBienvenida}",
+                    {
+                      "label": "Errores",
+                      "color": "#d62728"
+                    }
+                  ],
+                  [
+                    ".",
+                    "Throttles",
+                    ".",
+                    ".",
+                    {
+                      "label": "Limitadas (throttles)"
+                    }
+                  ],
+                  [
+                    ".",
+                    "Invocations",
+                    ".",
+                    ".",
+                    {
+                      "label": "Invocaciones",
+                      "yAxis": "right"
+                    }
+                  ]
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  TemaAlertasCriticasArn:
+    Value: !Ref TemaAlertasCriticas
+    Export:
+      Name: educloud-tema-alertas-criticas
+  TemaAlertasAvisosArn:
+    Value: !Ref TemaAlertasAvisos
+    Export:
+      Name: educloud-tema-alertas-avisos
+  UrlDashboard:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards/dashboard/EduCloud-Operaciones'

@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: '2010-09-09'   # Única versión válida del formato de plantilla (no es una fecha a actualizar)
+Description: 'Trail de CloudTrail multirregion con bucket S3 dedicado: eventos de gestion + eventos de datos de S3 (y opcionalmente Lambda)'
+# Autora: Maria Cecilia Alegre
+#
+# Sin trail, CloudTrail solo guarda 90 dias de EVENTOS DE GESTION en el "Historial de eventos".
+# Con este trail:
+#   - los eventos quedan en S3 todo el tiempo que se quiera (aca: 1 año),
+#   - se suman EVENTOS DE DATOS (quien leyo o escribio un archivo de S3, quien invoco una Lambda),
+#   - se registran TODAS las regiones, no solo la region donde se crea.
+#
+# =============================================================================
+# CLOUDTRAIL vs. CLOUDWATCH vs. AWS CONFIG vs. VPC FLOW LOGS
+# -----------------------------------------------------------------------------
+#  Servicio        | Pregunta que responde          | Que registra
+#  ----------------+--------------------------------+------------------------------------------
+#  CloudTrail      | QUIEN hizo QUE, CUANDO y desde | Llamadas a la API: userIdentity, eventName,
+#  (este trail)    | DONDE (auditoria)              | eventTime, sourceIPAddress, awsRegion
+#  CloudWatch      | COMO ESTAN mis recursos        | Metricas (CPU, red), logs de apps, alarmas
+#                  | (rendimiento y salud)          | -> "la CPU paso de 60 % durante 10 min"
+#  AWS Config      | COMO CAMBIO la configuracion   | Foto e historial de configuracion de cada
+#                  | y si CUMPLE las reglas         | recurso -> "el SG ahora tiene el 22 abierto
+#                  |                                |    y no cumple la regla restricted-ssh"
+#  VPC Flow Logs   | QUE TRAFICO paso por la red    | IP origen/destino, puertos, bytes, ACCEPT o
+#                  |                                | REJECT. NO dice que usuario de IAM fue.
+# -----------------------------------------------------------------------------
+# Mismo incidente, cuatro miradas ("alguien abrio SSH a 0.0.0.0/0"):
+#   CloudTrail -> AuthorizeSecurityGroupIngress, hecho por "pasante" a las 22:47
+#   Config     -> el antes y el despues del Security Group, marcado como no conforme
+#   Flow Logs  -> las conexiones que entraron despues al puerto 22
+#   CloudWatch -> la alarma que avisa (filtro de metricas sobre estos mismos logs)
+# Regla para el examen: CloudTrail registra quien CONFIGURO la red, no el trafico.
+# =============================================================================
+#
+# =============================================================================
+# COMO CONSULTAR LOS LOGS YA ENTREGADOS EN S3 (unos 5-15 min despues de cada accion)
+# Ruta: s3://cloudtrail-logs-<cuenta>-<region>/AWSLogs/<cuenta>/CloudTrail/<region>/<año>/<mes>/<dia>/
+#
+#   # 1) Bajar los archivos de hoy
+#   aws s3 cp s3://cloudtrail-logs-<cuenta>-us-east-1/AWSLogs/<cuenta>/CloudTrail/us-east-1/2026/11/04/ \
+#       logs/ --recursive
+#   # 2) Contar eventos de GESTION vs. de DATOS
+#   for f in logs/*.json.gz; do zcat "$f" | jq -r '.Records[].eventCategory'; done | sort | uniq -c
+#   # 3) Quien, que, desde donde y en que region, solo para los borrados de objetos (eventos de datos)
+#   for f in logs/*.json.gz; do zcat "$f"; echo; done | jq -r '.Records[] | select(.eventName=="DeleteObject")
+#       | [.eventTime, .userIdentity.arn, .eventName, .requestParameters.key, .sourceIPAddress, .awsRegion] | @tsv'
+#   # 4) Los encendidos y apagados de instancias (eventos de gestion)
+#   for f in logs/*.json.gz; do zcat "$f"; echo; done | jq -r '.Records[] | select(.eventName=="StartInstances" or .eventName=="StopInstances")
+#       | [.eventTime, .userIdentity.arn, .eventName, .sourceIPAddress, .awsRegion] | @tsv'
+#
+# Version automatizada: scripts/consultar_logs_s3.sh (usa analizar_auditoria.py).
+# =============================================================================
+
+Parameters:
+  NombreTrail:
+    Type: String
+    Default: trail-auditoria-cuenta
+  BucketVigilado:
+    Type: String
+    Default: educloud-contenido-usuarios-2026-use1
+    Description: Bucket cuyos objetos se auditan con eventos de datos (Pre-entrega 4)
+  SoloEscrituras:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'true = solo PutObject/DeleteObject (mas barato). false = tambien las lecturas (GetObject)'
+  ActivarInsights:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'true = CloudTrail Insights detecta picos anormales de llamadas y de errores (USD 0,35 cada 100.000 eventos analizados)'
+  IncluirLambda:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'true = registra cada invocacion de funciones Lambda (eventos de datos, con costo)'
+
+Conditions:
+  ConLambda: !Equals [!Ref IncluirLambda, 'true']
+  ConSoloEscrituras: !Equals [!Ref SoloEscrituras, 'true']
+  ConInsights: !Equals [!Ref ActivarInsights, 'true']
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # 1) BUCKET DE LOGS: privado, cifrado y con retencion definida.
+  # ---------------------------------------------------------------------------
+  BucketLogs:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain              # los logs de auditoria no se borran junto con el stack
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'cloudtrail-logs-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      VersioningConfiguration:
+        Status: Enabled                 # si alguien borra un log, queda la version anterior
+      LifecycleConfiguration:
+        Rules:
+          - Id: retencion-auditoria
+            Status: Enabled
+            # Sin transiciones a Glacier: los archivos de CloudTrail pesan pocos KB y, desde 2024,
+            # S3 no mueve por defecto objetos de menos de 128 KB (no conviene: cobra por objeto).
+            ExpirationInDays: 365             # se conservan 1 año
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+
+  # CloudTrail necesita permiso explicito para escribir en el bucket.
+  # La condicion aws:SourceArn evita que OTRO trail (de otra cuenta) use este bucket.
+  PoliticaBucketLogs:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BucketLogs
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudTrailRevisaAcl
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt BucketLogs.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${NombreTrail}'
+          - Sid: CloudTrailEscribeLogs
+            Effect: Allow
+            Principal: { Service: cloudtrail.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub '${BucketLogs.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${NombreTrail}'
+
+  # ---------------------------------------------------------------------------
+  # 2) TRAIL
+  # ---------------------------------------------------------------------------
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: PoliticaBucketLogs       # sin la politica, CloudTrail no puede validar el bucket
+    Properties:
+      TrailName: !Ref NombreTrail
+      S3BucketName: !Ref BucketLogs
+      IsLogging: true
+      IsMultiRegionTrail: true          # registra todas las regiones (alguien podria actuar en otra)
+      IncludeGlobalServiceEvents: true  # incluye servicios globales como IAM
+      EnableLogFileValidation: true     # archivos de resumen firmados: detecta si alguien altera un log
+      # CloudTrail Insights (opcional): aprende el nivel NORMAL de llamadas de escritura de gestion
+      # y genera un evento "Insight" cuando hay un pico anormal, por ejemplo 50 RunInstances de
+      # madrugada (ApiCallRateInsight) o una ola de AccessDenied (ApiErrorRateInsight).
+      # Necesita eventos de gestion en el trail. Los Insights llegan a la carpeta CloudTrail-Insight/.
+      InsightSelectors: !If
+        - ConInsights
+        - - InsightType: ApiCallRateInsight
+          - InsightType: ApiErrorRateInsight
+        - !Ref AWS::NoValue
+      # Selectores avanzados: definen QUE eventos se guardan.
+      AdvancedEventSelectors:
+        # a) Eventos de GESTION (plano de control): crear o borrar recursos, cambiar permisos...
+        #    La primera copia de los eventos de gestion en un trail no tiene costo.
+        - Name: Todos los eventos de gestion
+          FieldSelectors:
+            - Field: eventCategory
+              Equals: [Management]
+        # b) Eventos de DATOS de S3 (plano de datos): operaciones sobre los OBJETOS del bucket vigilado.
+        - Name: !If [ConSoloEscrituras, Escrituras y borrados de objetos del bucket vigilado, Lecturas y escrituras de objetos del bucket vigilado]
+          FieldSelectors:
+            - Field: eventCategory
+              Equals: [Data]
+            - Field: resources.type
+              Equals: ['AWS::S3::Object']
+            - Field: resources.ARN
+              StartsWith: [!Sub 'arn:${AWS::Partition}:s3:::${BucketVigilado}/']   # la barra final = objetos, no el bucket
+            - !If
+              - ConSoloEscrituras
+              - Field: readOnly
+                Equals: ['false']
+              - !Ref AWS::NoValue
+        # c) Eventos de DATOS de Lambda (opcional): cada Invoke de cualquier funcion.
+        - !If
+          - ConLambda
+          - Name: Invocaciones de funciones Lambda
+            FieldSelectors:
+              - Field: eventCategory
+                Equals: [Data]
+              - Field: resources.type
+                Equals: ['AWS::Lambda::Function']
+          - !Ref AWS::NoValue
+
+Outputs:
+  TrailArn:
+    Value: !GetAtt Trail.Arn
+  BucketDeLogs:
+    Description: 'Los logs llegan a AWSLogs/<cuenta>/CloudTrail/<region>/<año>/<mes>/<dia>/ (unos 5 minutos despues de cada accion)'
+    Value: !Ref BucketLogs

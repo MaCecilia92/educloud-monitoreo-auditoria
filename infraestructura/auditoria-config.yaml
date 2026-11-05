@@ -1,0 +1,345 @@
+AWSTemplateFormatVersion: '2010-09-09'   # Única versión válida del formato de plantilla (no es una fecha a actualizar)
+Description: 'EduCloud - Auditoria: AWS Config (grabador, canal de entrega, 6 reglas y remediacion de S3) + avisos de EventBridge sobre eventos criticos de CloudTrail'
+# Autora: Maria Cecilia Alegre - Pre-entrega 7
+#
+# Orden de despliegue:
+#   1) cloudtrail-trail.yaml     -> el trail multirregion que REGISTRA quien hizo cada cambio
+#   2) monitoreo-alarmas.yaml    -> crea los temas de SNS (los exporta con nombre)
+#   3) esta plantilla            -> Config evalua el ESTADO de los recursos y EventBridge avisa
+#                                   en minutos cuando CloudTrail ve un cambio critico.
+
+Resources:
+  # ===========================================================================
+  # AWS CONFIG: graba la configuracion de los recursos de red, computo y datos
+  # ===========================================================================
+  BucketConfig:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'educloud-config-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - Id: retencion-historial
+            Status: Enabled
+            ExpirationInDays: 365
+
+  PoliticaBucketConfig:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BucketConfig
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ConfigRevisaBucket
+            Effect: Allow
+            Principal: { Service: config.amazonaws.com }
+            Action: [s3:GetBucketAcl, s3:ListBucket]
+            Resource: !GetAtt BucketConfig.Arn
+            Condition:
+              StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
+          - Sid: ConfigEscribeHistorial
+            Effect: Allow
+            Principal: { Service: config.amazonaws.com }
+            Action: s3:PutObject
+            Resource: !Sub '${BucketConfig.Arn}/AWSLogs/${AWS::AccountId}/Config/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  RolConfig:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: config.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole   # permiso de lectura para describir los recursos
+
+  # Graba SOLO los tipos de recurso de EduCloud: cada cambio grabado (configuration item)
+  # cuesta USD 0,003, asi que no se graba "todo".
+  Grabador:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: educloud-grabador
+      RoleARN: !GetAtt RolConfig.Arn
+      RecordingGroup:
+        AllSupported: false
+        IncludeGlobalResourceTypes: false
+        RecordingStrategy:
+          UseOnly: INCLUSION_BY_RESOURCE_TYPES
+        ResourceTypes:
+          - AWS::EC2::VPC
+          - AWS::EC2::Subnet
+          - AWS::EC2::RouteTable
+          - AWS::EC2::SecurityGroup
+          - AWS::EC2::NetworkAcl
+          - AWS::EC2::InternetGateway
+          - AWS::EC2::NatGateway
+          - AWS::EC2::Instance
+          - AWS::ElasticLoadBalancingV2::LoadBalancer
+          - AWS::RDS::DBInstance
+          - AWS::S3::Bucket
+          - AWS::CloudTrail::Trail
+
+  CanalEntrega:
+    Type: AWS::Config::DeliveryChannel
+    DependsOn: PoliticaBucketConfig
+    Properties:
+      Name: educloud-canal
+      S3BucketName: !Ref BucketConfig
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours   # una "foto" completa por dia, ademas de cada cambio
+
+  # ===========================================================================
+  # REGLAS DE CONFIG (administradas por AWS)
+  # Las 3 principales son las primeras; las otras 3 completan la linea base.
+  # ===========================================================================
+  # 1) Ningun bucket con lectura publica (con remediacion automatica, mas abajo)
+  ReglaS3SinLecturaPublica:
+    Type: AWS::Config::ConfigRule
+    DependsOn: [Grabador, CanalEntrega]
+    Properties:
+      ConfigRuleName: s3-bucket-public-read-prohibited
+      Description: Ningun bucket de S3 permite lectura publica (videos, PDFs y backups de EduCloud).
+      Scope: { ComplianceResourceTypes: ['AWS::S3::Bucket'] }
+      Source: { Owner: AWS, SourceIdentifier: S3_BUCKET_PUBLIC_READ_PROHIBITED }
+
+  # 2) Ningun Security Group con SSH (22) abierto a 0.0.0.0/0. Los SG de la Pre-entrega 6
+  #    no abren el 22 (se usa Session Manager): si alguien lo abre, esta regla lo marca.
+  ReglaSinSshAbierto:
+    Type: AWS::Config::ConfigRule
+    DependsOn: [Grabador, CanalEntrega]
+    Properties:
+      ConfigRuleName: restricted-ssh
+      Description: Ningun Security Group permite SSH (puerto 22) desde 0.0.0.0/0.
+      Scope: { ComplianceResourceTypes: ['AWS::EC2::SecurityGroup'] }
+      Source: { Owner: AWS, SourceIdentifier: INCOMING_SSH_DISABLED }
+
+  # 3) La base de datos nunca accesible desde internet (PubliclyAccessible = false, Pre-entrega 5)
+  ReglaRdsNoPublica:
+    Type: AWS::Config::ConfigRule
+    DependsOn: [Grabador, CanalEntrega]
+    Properties:
+      ConfigRuleName: rds-instance-public-access-check
+      Description: Ninguna instancia de RDS es accesible publicamente.
+      Scope: { ComplianceResourceTypes: ['AWS::RDS::DBInstance'] }
+      Source: { Owner: AWS, SourceIdentifier: RDS_INSTANCE_PUBLIC_ACCESS_CHECK }
+
+  # 4) Las EC2 viven en subredes privadas: ninguna debe tener IP publica
+  ReglaEc2SinIpPublica:
+    Type: AWS::Config::ConfigRule
+    DependsOn: [Grabador, CanalEntrega]
+    Properties:
+      ConfigRuleName: ec2-instance-no-public-ip
+      Description: Las instancias EC2 de la aplicacion no tienen IP publica.
+      Scope: { ComplianceResourceTypes: ['AWS::EC2::Instance'] }
+      Source: { Owner: AWS, SourceIdentifier: EC2_INSTANCE_NO_PUBLIC_IP }
+
+  # 5) La base de datos cifrada en reposo
+  ReglaRdsCifrada:
+    Type: AWS::Config::ConfigRule
+    DependsOn: [Grabador, CanalEntrega]
+    Properties:
+      ConfigRuleName: rds-storage-encrypted
+      Description: El almacenamiento de RDS esta cifrado con KMS.
+      Scope: { ComplianceResourceTypes: ['AWS::RDS::DBInstance'] }
+      Source: { Owner: AWS, SourceIdentifier: RDS_STORAGE_ENCRYPTED }
+
+  # 6) La auditoria en si: debe existir un trail multirregion activo (regla periodica)
+  ReglaTrailMultirregion:
+    Type: AWS::Config::ConfigRule
+    DependsOn: [Grabador, CanalEntrega]
+    Properties:
+      ConfigRuleName: multi-region-cloudtrail-enabled
+      Description: Hay al menos un trail de CloudTrail multirregion registrando.
+      MaximumExecutionFrequency: TwentyFour_Hours
+      Source: { Owner: AWS, SourceIdentifier: MULTI_REGION_CLOUD_TRAIL_ENABLED }
+
+  # ---------------------------------------------------------------------------
+  # REMEDIACION AUTOMATICA de la regla 1 (ejercicio anterior): Systems Manager Automation
+  # activa Block Public Access en el bucket que quedo NON_COMPLIANT.
+  # ---------------------------------------------------------------------------
+  RolRemediacion:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ssm.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cerrar-acceso-publico-s3
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutBucketPublicAccessBlock, s3:GetBucketPublicAccessBlock]
+                Resource: 'arn:aws:s3:::*'
+
+  RemediacionS3:
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+      ConfigRuleName: !Ref ReglaS3SinLecturaPublica
+      TargetType: SSM_DOCUMENT
+      TargetId: AWS-DisableS3BucketPublicReadWrite
+      Automatic: true
+      MaximumAutomaticAttempts: 3
+      RetryAttemptSeconds: 60
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values: [!GetAtt RolRemediacion.Arn]
+        S3BucketName:
+          ResourceValue:
+            Value: RESOURCE_ID              # Config completa el nombre del bucket no conforme
+
+  # ===========================================================================
+  # EVENTBRIDGE: aviso en minutos cuando CloudTrail registra un cambio critico
+  # (Config dice COMO quedo el recurso; CloudTrail dice QUIEN lo cambio)
+  # ===========================================================================
+  # 1) Cambios en la RED de la Pre-entrega 6: Security Groups, NACL, rutas, gateways, VPC
+  AvisoCambiosRed:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: educloud-cambios-criticos-red
+      Description: Avisa por SNS cada vez que alguien cambia Security Groups, NACL, rutas o la VPC
+      State: ENABLED
+      EventPattern:
+        source: [aws.ec2]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [ec2.amazonaws.com]
+          eventName:
+            - AuthorizeSecurityGroupIngress
+            - AuthorizeSecurityGroupEgress
+            - RevokeSecurityGroupIngress
+            - RevokeSecurityGroupEgress
+            - ModifySecurityGroupRules
+            - DeleteSecurityGroup
+            - CreateNetworkAclEntry
+            - ReplaceNetworkAclEntry
+            - DeleteNetworkAclEntry
+            - CreateRoute
+            - ReplaceRoute
+            - DeleteRoute
+            - DetachInternetGateway
+            - DeleteNatGateway
+            - DeleteSubnet
+            - DeleteVpc
+      Targets:
+        - Id: sns-criticas
+          Arn: !ImportValue educloud-tema-alertas-criticas
+          InputTransformer:
+            InputPathsMap:
+              accion: $.detail.eventName
+              quien: $.detail.userIdentity.arn
+              ip: $.detail.sourceIPAddress
+              region: $.detail.awsRegion
+              hora: $.detail.eventTime
+            # Solo campos que existen en TODOS estos eventos; el detalle completo
+            # (que regla, que Security Group) queda en CloudTrail.
+            InputTemplate: '"CAMBIO DE RED: <accion> por <quien> desde <ip> en <region> a las <hora>. Detalle en CloudTrail > Historial de eventos."'
+
+  # 2) Alguien intenta APAGAR la auditoria (lo primero que haria un atacante)
+  AvisoManipulacionAuditoria:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: educloud-manipulacion-auditoria
+      Description: Avisa si alguien detiene o borra CloudTrail o AWS Config
+      State: ENABLED
+      EventPattern:
+        source: [aws.cloudtrail, aws.config]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventName:
+            - StopLogging
+            - DeleteTrail
+            - UpdateTrail
+            - PutEventSelectors
+            - StopConfigurationRecorder
+            - DeleteConfigurationRecorder
+            - DeleteDeliveryChannel
+      Targets:
+        - Id: sns-criticas
+          Arn: !ImportValue educloud-tema-alertas-criticas
+
+  # 3) Cambios peligrosos en datos: base publica o borrada, bucket abierto
+  AvisoCambiosDatos:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: educloud-cambios-criticos-datos
+      Description: Avisa si se borra o expone la base de datos o se abre un bucket
+      State: ENABLED
+      EventPattern:
+        source: [aws.rds, aws.s3]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventName:
+            - DeleteDBInstance
+            - ModifyDBInstance
+            - PutBucketPolicy
+            - DeleteBucketPolicy
+            - PutBucketAcl
+            - DeletePublicAccessBlock
+      Targets:
+        - Id: sns-criticas
+          Arn: !ImportValue educloud-tema-alertas-criticas
+
+  # 4) Uso del usuario root (no deberia usarse nunca en el dia a dia)
+  AvisoLoginRoot:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: educloud-login-root
+      Description: Avisa cada vez que alguien entra a la consola con el usuario root
+      State: ENABLED
+      EventPattern:
+        detail-type: [AWS Console Sign In via CloudTrail]
+        detail:
+          userIdentity:
+            type: [Root]
+      Targets:
+        - Id: sns-criticas
+          Arn: !ImportValue educloud-tema-alertas-criticas
+
+  # 5) Resultado de las reglas de Config: un recurso paso a NON_COMPLIANT
+  AvisoIncumplimientoConfig:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: educloud-config-no-conforme
+      Description: Avisa cuando un recurso deja de cumplir una regla de AWS Config
+      State: ENABLED
+      EventPattern:
+        source: [aws.config]
+        detail-type: [Config Rules Compliance Change]
+        detail:
+          newEvaluationResult:
+            complianceType: [NON_COMPLIANT]
+      Targets:
+        - Id: sns-avisos
+          Arn: !ImportValue educloud-tema-alertas-avisos
+          InputTransformer:
+            InputPathsMap:
+              regla: $.detail.configRuleName
+              tipo: $.detail.resourceType
+              recurso: $.detail.resourceId
+            InputTemplate: '"NO CONFORME: <tipo> <recurso> incumple la regla <regla>. Ver AWS Config > Reglas."'
+
+Outputs:
+  BucketHistorialConfig:
+    Value: !Ref BucketConfig
