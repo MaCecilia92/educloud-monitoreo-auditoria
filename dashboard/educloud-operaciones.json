@@ -1,0 +1,724 @@
+{
+  "start": "-PT24H",
+  "widgets": [
+    {
+      "type": "text",
+      "x": 0,
+      "y": 0,
+      "width": 10,
+      "height": 4,
+      "properties": {
+        "markdown": "## EduCloud · Operaciones\n**Primero mirá el estado de las alarmas (derecha).** Si todo está en verde, recorré las filas de arriba hacia abajo: **Cómputo → Red → Datos → Costos y errores**.\n\nRegión us-east-1 · Últimas 24 h · Plan completo: [README](https://github.com/MaCecilia92/educloud-monitoreo-auditoria)"
+      }
+    },
+    {
+      "type": "alarm",
+      "x": 10,
+      "y": 0,
+      "width": 14,
+      "height": 4,
+      "properties": {
+        "title": "① Estado de las alarmas críticas",
+        "alarms": [
+          "arn:aws:cloudwatch:us-east-1:REEMPLAZAR_ID_CUENTA:alarm:educloud-ec2-chequeo-estado",
+          "arn:aws:cloudwatch:us-east-1:REEMPLAZAR_ID_CUENTA:alarm:educloud-alb-sin-destinos-sanos",
+          "arn:aws:cloudwatch:us-east-1:REEMPLAZAR_ID_CUENTA:alarm:educloud-alb-errores-5xx",
+          "arn:aws:cloudwatch:us-east-1:REEMPLAZAR_ID_CUENTA:alarm:educloud-rds-espacio-libre-bajo",
+          "arn:aws:cloudwatch:us-east-1:REEMPLAZAR_ID_CUENTA:alarm:educloud-cloudfront-tasa-5xx",
+          "arn:aws:cloudwatch:us-east-1:REEMPLAZAR_ID_CUENTA:alarm:educloud-facturacion-mayor-25usd"
+        ],
+        "sortBy": "stateUpdatedTimestamp"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 4,
+      "width": 4,
+      "height": 4,
+      "properties": {
+        "title": "Instancias sanas (ALB)",
+        "view": "singleValue",
+        "region": "us-east-1",
+        "stat": "Minimum",
+        "period": 300,
+        "metrics": [
+          [
+            "AWS/ApplicationELB",
+            "HealthyHostCount",
+            "TargetGroup",
+            "targetgroup/educloud-web/REEMPLAZAR",
+            "LoadBalancer",
+            "app/educloud-alb/REEMPLAZAR",
+            {
+              "label": "Sanas"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 4,
+      "y": 4,
+      "width": 4,
+      "height": 4,
+      "properties": {
+        "title": "Errores 5xx (5 min)",
+        "view": "singleValue",
+        "region": "us-east-1",
+        "stat": "Sum",
+        "period": 300,
+        "metrics": [
+          [
+            "AWS/ApplicationELB",
+            "HTTPCode_Target_5XX_Count",
+            "LoadBalancer",
+            "app/educloud-alb/REEMPLAZAR",
+            {
+              "label": "5xx de la app"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 8,
+      "y": 4,
+      "width": 4,
+      "height": 4,
+      "properties": {
+        "title": "Tiempo de respuesta p95",
+        "view": "singleValue",
+        "region": "us-east-1",
+        "stat": "p95",
+        "period": 300,
+        "metrics": [
+          [
+            "AWS/ApplicationELB",
+            "TargetResponseTime",
+            "LoadBalancer",
+            "app/educloud-alb/REEMPLAZAR",
+            {
+              "label": "Segundos"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 4,
+      "width": 4,
+      "height": 4,
+      "properties": {
+        "title": "Espacio libre en RDS",
+        "view": "singleValue",
+        "region": "us-east-1",
+        "stat": "Minimum",
+        "period": 300,
+        "metrics": [
+          [
+            {
+              "expression": "m1/1073741824",
+              "label": "GiB libres",
+              "id": "e1"
+            }
+          ],
+          [
+            "AWS/RDS",
+            "FreeStorageSpace",
+            "DBInstanceIdentifier",
+            "educloud-mysql",
+            {
+              "id": "m1",
+              "visible": false
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 16,
+      "y": 4,
+      "width": 4,
+      "height": 4,
+      "properties": {
+        "title": "Almacenamiento en S3 (contenido)",
+        "view": "singleValue",
+        "region": "us-east-1",
+        "stat": "Average",
+        "period": 86400,
+        "metrics": [
+          [
+            {
+              "expression": "m1/1073741824",
+              "label": "GiB en S3 Standard",
+              "id": "e1"
+            }
+          ],
+          [
+            "AWS/S3",
+            "BucketSizeBytes",
+            "BucketName",
+            "educloud-contenido-usuarios-2026-use1",
+            "StorageType",
+            "StandardStorage",
+            {
+              "id": "m1",
+              "visible": false
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 20,
+      "y": 4,
+      "width": 4,
+      "height": 4,
+      "properties": {
+        "title": "Gasto estimado del mes (USD)",
+        "view": "singleValue",
+        "region": "us-east-1",
+        "stat": "Maximum",
+        "period": 21600,
+        "metrics": [
+          [
+            "AWS/Billing",
+            "EstimatedCharges",
+            "Currency",
+            "USD",
+            {
+              "label": "USD acumulados"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 8,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "Cómputo · CPU del Auto Scaling Group (%)",
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "stat": "Average",
+        "period": 300,
+        "metrics": [
+          [
+            "AWS/EC2",
+            "CPUUtilization",
+            "AutoScalingGroupName",
+            "educloud-web-asg",
+            {
+              "label": "CPU promedio"
+            }
+          ],
+          [
+            "...",
+            {
+              "stat": "Maximum",
+              "label": "CPU máxima"
+            }
+          ]
+        ],
+        "yAxis": {
+          "left": {
+            "min": 0,
+            "max": 100,
+            "showUnits": false,
+            "label": "%"
+          }
+        },
+        "annotations": {
+          "horizontal": [
+            {
+              "label": "Escala el ASG (60 %)",
+              "value": 60,
+              "color": "#ff7f0e"
+            },
+            {
+              "label": "Alarma (80 %)",
+              "value": 80,
+              "color": "#d62728"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 8,
+      "y": 8,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "Cómputo · Pedidos y errores en el ALB",
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "stat": "Sum",
+        "period": 300,
+        "metrics": [
+          [
+            "AWS/ApplicationELB",
+            "RequestCount",
+            "LoadBalancer",
+            "app/educloud-alb/REEMPLAZAR",
+            {
+              "label": "Pedidos"
+            }
+          ],
+          [
+            ".",
+            "HTTPCode_Target_5XX_Count",
+            ".",
+            ".",
+            {
+              "label": "5xx de la app",
+              "yAxis": "right",
+              "color": "#d62728"
+            }
+          ],
+          [
+            ".",
+            "HTTPCode_ELB_5XX_Count",
+            ".",
+            ".",
+            {
+              "label": "5xx del ALB",
+              "yAxis": "right",
+              "color": "#9467bd"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 16,
+      "y": 8,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "Cómputo · Salud de las instancias",
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "stat": "Average",
+        "period": 300,
+        "metrics": [
+          [
+            "AWS/ApplicationELB",
+            "HealthyHostCount",
+            "TargetGroup",
+            "targetgroup/educloud-web/REEMPLAZAR",
+            "LoadBalancer",
+            "app/educloud-alb/REEMPLAZAR",
+            {
+              "label": "Sanas",
+              "color": "#2ca02c"
+            }
+          ],
+          [
+            ".",
+            "UnHealthyHostCount",
+            ".",
+            ".",
+            ".",
+            ".",
+            {
+              "label": "No sanas",
+              "color": "#d62728"
+            }
+          ],
+          [
+            "AWS/EC2",
+            "StatusCheckFailed",
+            "AutoScalingGroupName",
+            "educloud-web-asg",
+            {
+              "stat": "Maximum",
+              "label": "Chequeo fallido (0/1)"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 14,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "Red · Tráfico saliente por los NAT Gateway",
+        "view": "timeSeries",
+        "stacked": true,
+        "region": "us-east-1",
+        "stat": "Sum",
+        "period": 300,
+        "metrics": [
+          [
+            "AWS/NATGateway",
+            "BytesOutToDestination",
+            "NatGatewayId",
+            "nat-REEMPLAZAR_A",
+            {
+              "label": "NAT A → internet"
+            }
+          ],
+          [
+            "...",
+            "nat-REEMPLAZAR_B",
+            {
+              "label": "NAT B → internet"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 8,
+      "y": 14,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "Red · Problemas en los NAT Gateway",
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "stat": "Sum",
+        "period": 300,
+        "metrics": [
+          [
+            "AWS/NATGateway",
+            "ErrorPortAllocation",
+            "NatGatewayId",
+            "nat-REEMPLAZAR_A",
+            {
+              "label": "Error de puertos A"
+            }
+          ],
+          [
+            "...",
+            "nat-REEMPLAZAR_B",
+            {
+              "label": "Error de puertos B"
+            }
+          ],
+          [
+            ".",
+            "PacketsDropCount",
+            ".",
+            "nat-REEMPLAZAR_A",
+            {
+              "label": "Paquetes descartados A"
+            }
+          ],
+          [
+            "...",
+            "nat-REEMPLAZAR_B",
+            {
+              "label": "Paquetes descartados B"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 16,
+      "y": 14,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "Red · CloudFront (usuarios de todo el mundo)",
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "period": 300,
+        "metrics": [
+          [
+            "AWS/CloudFront",
+            "Requests",
+            "DistributionId",
+            "REEMPLAZAR_DISTRIBUCION",
+            "Region",
+            "Global",
+            {
+              "stat": "Sum",
+              "label": "Pedidos"
+            }
+          ],
+          [
+            ".",
+            "5xxErrorRate",
+            ".",
+            ".",
+            ".",
+            ".",
+            {
+              "stat": "Average",
+              "label": "Tasa 5xx (%)",
+              "yAxis": "right",
+              "color": "#d62728"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 20,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "Datos · Espacio libre en RDS (GiB)",
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "stat": "Minimum",
+        "period": 300,
+        "metrics": [
+          [
+            {
+              "expression": "m1/1073741824",
+              "label": "GiB libres",
+              "id": "e1"
+            }
+          ],
+          [
+            "AWS/RDS",
+            "FreeStorageSpace",
+            "DBInstanceIdentifier",
+            "educloud-mysql",
+            {
+              "id": "m1",
+              "visible": false
+            }
+          ]
+        ],
+        "yAxis": {
+          "left": {
+            "min": 0,
+            "showUnits": false,
+            "label": "GiB"
+          }
+        },
+        "annotations": {
+          "horizontal": [
+            {
+              "label": "Alarma (3 GiB = 15 %)",
+              "value": 3,
+              "color": "#d62728",
+              "fill": "below"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 8,
+      "y": 20,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "Datos · Carga de RDS",
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "stat": "Average",
+        "period": 300,
+        "metrics": [
+          [
+            "AWS/RDS",
+            "CPUUtilization",
+            "DBInstanceIdentifier",
+            "educloud-mysql",
+            {
+              "label": "CPU (%)"
+            }
+          ],
+          [
+            ".",
+            "DatabaseConnections",
+            ".",
+            ".",
+            {
+              "label": "Conexiones",
+              "yAxis": "right"
+            }
+          ],
+          [
+            ".",
+            "ReadLatency",
+            ".",
+            ".",
+            {
+              "label": "Latencia de lectura (s)",
+              "yAxis": "right",
+              "visible": false
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 16,
+      "y": 20,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "Datos · Crecimiento del bucket de contenido (30 días)",
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "stat": "Average",
+        "period": 86400,
+        "start": "-P30D",
+        "metrics": [
+          [
+            {
+              "expression": "m1/1073741824",
+              "label": "GiB (S3 Standard)",
+              "id": "e1"
+            }
+          ],
+          [
+            "AWS/S3",
+            "BucketSizeBytes",
+            "BucketName",
+            "educloud-contenido-usuarios-2026-use1",
+            "StorageType",
+            "StandardStorage",
+            {
+              "id": "m1",
+              "visible": false
+            }
+          ],
+          [
+            ".",
+            "NumberOfObjects",
+            ".",
+            ".",
+            "StorageType",
+            "AllStorageTypes",
+            {
+              "label": "Cantidad de objetos",
+              "yAxis": "right"
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 26,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "Costos · Gasto estimado acumulado del mes (USD)",
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "stat": "Maximum",
+        "period": 21600,
+        "start": "-P30D",
+        "metrics": [
+          [
+            "AWS/Billing",
+            "EstimatedCharges",
+            "Currency",
+            "USD",
+            {
+              "label": "USD"
+            }
+          ]
+        ],
+        "annotations": {
+          "horizontal": [
+            {
+              "label": "Aviso USD 10",
+              "value": 10,
+              "color": "#ff7f0e"
+            },
+            {
+              "label": "Crítica USD 25",
+              "value": 25,
+              "color": "#d62728"
+            },
+            {
+              "label": "Presupuesto USD 30",
+              "value": 30,
+              "color": "#7f7f7f"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "log",
+      "x": 8,
+      "y": 26,
+      "width": 10,
+      "height": 6,
+      "properties": {
+        "title": "Errores · Endpoints de la API con más errores 5xx (Logs Insights)",
+        "region": "us-east-1",
+        "view": "table",
+        "query": "SOURCE '/educloud/app' | parse @message '\"* * *\" * *' as metodo, ruta, protocolo, codigo, bytes | filter codigo like /^5/ | stats count(*) as errores by ruta, codigo | sort errores desc | limit 10"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 18,
+      "y": 26,
+      "width": 6,
+      "height": 6,
+      "properties": {
+        "title": "Errores · Lambda enviar-bienvenida",
+        "view": "timeSeries",
+        "region": "us-east-1",
+        "stat": "Sum",
+        "period": 300,
+        "metrics": [
+          [
+            "AWS/Lambda",
+            "Errors",
+            "FunctionName",
+            "enviar-bienvenida",
+            {
+              "label": "Errores",
+              "color": "#d62728"
+            }
+          ],
+          [
+            ".",
+            "Throttles",
+            ".",
+            ".",
+            {
+              "label": "Limitadas (throttles)"
+            }
+          ],
+          [
+            ".",
+            "Invocations",
+            ".",
+            ".",
+            {
+              "label": "Invocaciones",
+              "yAxis": "right"
+            }
+          ]
+        ]
+      }
+    }
+  ]
+}
